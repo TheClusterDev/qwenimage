@@ -22,7 +22,8 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2Tokenizer, Qwe
 
 from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import QwenImageLoraLoaderMixin
-from diffusers.models import AutoencoderKLQwenImage, QwenImageTransformer2DModel
+from diffusers.models import AutoencoderKLQwenImage
+from .transformer_qwenimage import QwenImageTransformer2DModel
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import is_torch_xla_available, logging, replace_example_docstring
 from diffusers.utils.torch_utils import randn_tensor
@@ -97,7 +98,7 @@ def retrieve_timesteps(
             The scheduler to get timesteps from.
         num_inference_steps (`int`):
             The number of diffusion steps used when generating samples with a pre-trained model. If used, `timesteps`
-            must be `None`.
+            must be `None`.QD
         device (`str` or `torch.device`, *optional*):
             The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
         timesteps (`List[int]`, *optional*):
