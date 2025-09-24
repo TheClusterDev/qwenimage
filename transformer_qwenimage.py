@@ -323,25 +323,40 @@ class QwenDoubleStreamAttnProcessor2_0:
         if attn.norm_added_k is not None:
             txt_key = attn.norm_added_k(txt_key)
 
+        # --- normalize rotary kwarg names and convert complex freqs to (cos, sin) for SM 8.x ---
+        rotary = image_rotary_emb
+        if rotary is None:
+            # accept legacy aliases
+            rotary = kwargs.pop("image_rotary_embs", None) or kwargs.pop("rotary_emb", None) or kwargs.pop("image_rope", None)
+
+        if rotary is not None:
+            img_freqs, txt_freqs = rotary
+
+            # L40s (SM 8.9) can choke on complex inductor graphs. Convert complex -> (cos, sin) real pair.
+            def to_cossin(z):
+                if torch.is_complex(z):
+                    return (z.real.contiguous(), z.imag.contiguous())
+                # already (cos, sin)
+                if isinstance(z, (tuple, list)) and len(z) == 2:
+                    return (z[0], z[1])
+                raise ValueError("Unexpected rotary format")
+
+            img_cos, img_sin = to_cossin(img_freqs)
+            txt_cos, txt_sin = to_cossin(txt_freqs)
+            image_rotary_emb = ((img_cos, img_sin), (txt_cos, txt_sin))
+        else:
+            image_rotary_emb = None
+        # -------------------------------------------------------------------
+
         # Apply RoPE
         if image_rotary_emb is not None:
-            img_freqs, txt_freqs = image_rotary_emb  # can be complex or (cos, sin)
+            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+            img_query = apply_rotary_emb_qwen(img_query, (img_cos, img_sin), use_real=True, use_real_unbind_dim=-1)
+            img_key   = apply_rotary_emb_qwen(img_key,   (img_cos, img_sin), use_real=True, use_real_unbind_dim=-1)
+            txt_query = apply_rotary_emb_qwen(txt_query, (txt_cos, txt_sin), use_real=True, use_real_unbind_dim=-1)
+            txt_key   = apply_rotary_emb_qwen(txt_key,   (txt_cos, txt_sin), use_real=True, use_real_unbind_dim=-1)
         
-            img_cos_sin = _rope_to_cos_sin(img_freqs)
-            txt_cos_sin = _rope_to_cos_sin(txt_freqs)
-        
-            # ensure device/dtype match the target tensors
-            img_cos_sin = (img_cos_sin[0].to(img_query.device, dtype=img_query.dtype),
-                           img_cos_sin[1].to(img_query.device, dtype=img_query.dtype))
-            txt_cos_sin = (txt_cos_sin[0].to(txt_query.device, dtype=txt_query.dtype),
-                           txt_cos_sin[1].to(txt_query.device, dtype=txt_query.dtype))
-        
-            img_query = _apply_rope_safe(img_query, img_cos_sin)
-            img_key   = _apply_rope_safe(img_key,   img_cos_sin)
-            txt_query = _apply_rope_safe(txt_query, txt_cos_sin)
-            txt_key   = _apply_rope_safe(txt_key,   txt_cos_sin)
-
-        # Concatenate for joint attention
+    # Concatenate for joint attention
         # Order: [text, image]
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
