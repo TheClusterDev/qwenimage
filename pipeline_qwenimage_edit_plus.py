@@ -770,21 +770,8 @@ class QwenImageEditPlusPipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
             self._attention_kwargs = {}
 
         txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist() if prompt_embeds_mask is not None else None
-
+        
         image_rotary_emb = self.transformer.pos_embed(img_shapes, txt_seq_lens, device=latents.device)
-
-        def _to_cossin_pair(freqs):
-        # Accept complex [S,D] or already (cos,sin)
-            if isinstance(freqs, (tuple, list)) and len(freqs) == 2:
-                return freqs
-            if torch.is_complex(freqs):
-                return freqs.real.contiguous(), freqs.imag.contiguous()
-            return freqs  # leave as-is; FA3 will normalize
-
-        if image_rotary_emb is not None:
-            img_f, txt_f = image_rotary_emb
-            image_rotary_emb = (_to_cossin_pair(img_f), _to_cossin_pair(txt_f))
-    
         if do_true_cfg:
             negative_txt_seq_lens = (
                 negative_prompt_embeds_mask.sum(dim=1).tolist()

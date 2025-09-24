@@ -36,23 +36,6 @@ from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-# ---- RoPE helpers (real-valued, robust) ----
-def _rope_to_cos_sin(freqs):
-    # Accepts complex [S, D/2] or a (cos, sin) tuple; returns contiguous float32 (cos, sin)
-    if isinstance(freqs, (tuple, list)) and len(freqs) == 2:
-        cos, sin = freqs
-    elif torch.is_complex(freqs):
-        cos, sin = freqs.real, freqs.imag
-    else:
-        raise TypeError("image_rotary_emb must be complex RoPE or a (cos, sin) tuple")
-    return cos.contiguous().to(torch.float32), sin.contiguous().to(torch.float32)
-
-def _apply_rope_safe(x, cos_sin):
-    # Try standard pairing first; if layout differs (models vary), fall back.
-    try:
-        return apply_rotary_emb_qwen(x, cos_sin, use_real=True, use_real_unbind_dim=-1)
-    except Exception:
-        return apply_rotary_emb_qwen(x, cos_sin, use_real=True, use_real_unbind_dim=-2)
 
 def get_timestep_embedding(
     timesteps: torch.Tensor,
@@ -127,8 +110,9 @@ def apply_rotary_emb_qwen(
     """
     if use_real:
         cos, sin = freqs_cis  # [S, D]
-        cos = cos[None, None].to(x.device, dtype=x.dtype)
-        sin = sin[None, None].to(x.device, dtype=x.dtype)
+        cos = cos[None, None]
+        sin = sin[None, None]
+        cos, sin = cos.to(x.device), sin.to(x.device)
 
         if use_real_unbind_dim == -1:
             # Used for flux, cogvideox, hunyuan-dit
@@ -323,34 +307,15 @@ class QwenDoubleStreamAttnProcessor2_0:
         if attn.norm_added_k is not None:
             txt_key = attn.norm_added_k(txt_key)
 
-        rotary = image_rotary_emb  # only this kw is supported here
-
-        if rotary is not None:
-            img_freqs, txt_freqs = rotary
-
-            # Convert complex RoPE -> (cos, sin) real pair (L40S dislikes complex in induction graphs)
-            def to_cossin(z):
-                if torch.is_complex(z):
-                    return (z.real.contiguous(), z.imag.contiguous())
-                if isinstance(z, (tuple, list)) and len(z) == 2:
-                    return (z[0].contiguous(), z[1].contiguous())
-                raise ValueError("Unexpected rotary format; expected complex or (cos, sin)")
-
-            img_cos, img_sin = to_cossin(img_freqs)
-            txt_cos, txt_sin = to_cossin(txt_freqs)
-            image_rotary_emb = ((img_cos, img_sin), (txt_cos, txt_sin))
-        else:
-            image_rotary_emb = None
-
         # Apply RoPE
         if image_rotary_emb is not None:
-            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
-            img_query = apply_rotary_emb_qwen(img_query, (img_cos, img_sin), use_real=True, use_real_unbind_dim=-1)
-            img_key   = apply_rotary_emb_qwen(img_key,   (img_cos, img_sin), use_real=True, use_real_unbind_dim=-1)
-            txt_query = apply_rotary_emb_qwen(txt_query, (txt_cos, txt_sin), use_real=True, use_real_unbind_dim=-1)
-            txt_key   = apply_rotary_emb_qwen(txt_key,   (txt_cos, txt_sin), use_real=True, use_real_unbind_dim=-1)
-        
-    # Concatenate for joint attention
+            img_freqs, txt_freqs = image_rotary_emb
+            img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
+            img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
+            txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
+            txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+
+        # Concatenate for joint attention
         # Order: [text, image]
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
@@ -574,48 +539,68 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         self.gradient_checkpointing = False
 
     def forward(
-            self,
-            hidden_states: torch.Tensor,
-            encoder_hidden_states: torch.Tensor = None,
-            encoder_hidden_states_mask: torch.Tensor = None,
-            timestep: torch.LongTensor = None,
-            image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-            img_shapes: Optional[Tuple[int, int]] = None,
-            txt_seq_lens: Optional[torch.Tensor] = None,
-            guidance: torch.Tensor = None,
-            attention_kwargs: Optional[Dict[str, Any]] = None,
-            return_dict: bool = True,
-            **kwargs,
-        ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        guidance: torch.Tensor = None,  # TODO: this should probably be removed
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        return_dict: bool = True,
+    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        """
+        The [`QwenTransformer2DModel`] forward method.
+        Args:
+            hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
+                Input `hidden_states`.
+            encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
+                Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
+            encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
+                Mask of the input conditions.
+            timestep ( `torch.LongTensor`):
+                Used to indicate denoising step.
+            attention_kwargs (`dict`, *optional*):
+                A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
+                `self.processor` in
+                [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
+            return_dict (`bool`, *optional*, defaults to `True`):
+                Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
+                tuple.
+        Returns:
+            If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
+            `tuple` where the first element is the sample tensor.
+        """
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
         else:
-            attention_kwargs = {}
             lora_scale = 1.0
-    
-        # Do NOT stuff image_rotary_emb into attention_kwargs, we pass it explicitly.
-        for k, v in (("img_shapes", img_shapes), ("txt_seq_lens", txt_seq_lens)):
-            if v is not None and k not in attention_kwargs:
-                 attention_kwargs[k] = v
-       
+
         if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
             scale_lora_layers(self, lora_scale)
         else:
-            if "scale" in attention_kwargs:
-                logger.warning("Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective.")
-    
+            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
+                )
+
         hidden_states = self.img_in(hidden_states)
-    
+
         timestep = timestep.to(hidden_states.dtype)
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
-    
+
         if guidance is not None:
             guidance = guidance.to(hidden_states.dtype) * 1000
-    
-        temb = self.time_text_embed(timestep, hidden_states) if guidance is None else self.time_text_embed(timestep, guidance, hidden_states)
-    
+
+        temb = (
+            self.time_text_embed(timestep, hidden_states)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states)
+        )
+
         for index_block, block in enumerate(self.transformer_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
@@ -626,6 +611,7 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                     temb,
                     image_rotary_emb,
                 )
+
             else:
                 encoder_hidden_states, hidden_states = block(
                     hidden_states=hidden_states,
@@ -635,112 +621,16 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=attention_kwargs,
                 )
-    
+
+        # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb)
         output = self.proj_out(hidden_states)
-    
+
         if USE_PEFT_BACKEND:
+            # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
-    
+
         if not return_dict:
             return (output,)
-    
+
         return Transformer2DModelOutput(sample=output)
-
-
-    # def forward(
-    #     self,
-    #     hidden_states: torch.Tensor,
-    #     encoder_hidden_states: torch.Tensor = None,
-    #     encoder_hidden_states_mask: torch.Tensor = None,
-    #     timestep: torch.LongTensor = None,
-    #     image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    #     guidance: torch.Tensor = None,  # TODO: this should probably be removed
-    #     attention_kwargs: Optional[Dict[str, Any]] = None,
-    #     return_dict: bool = True,
-    # ) -> Union[torch.Tensor, Transformer2DModelOutput]:
-    #     """
-    #     The [`QwenTransformer2DModel`] forward method.
-    #     Args:
-    #         hidden_states (`torch.Tensor` of shape `(batch_size, image_sequence_length, in_channels)`):
-    #             Input `hidden_states`.
-    #         encoder_hidden_states (`torch.Tensor` of shape `(batch_size, text_sequence_length, joint_attention_dim)`):
-    #             Conditional embeddings (embeddings computed from the input conditions such as prompts) to use.
-    #         encoder_hidden_states_mask (`torch.Tensor` of shape `(batch_size, text_sequence_length)`):
-    #             Mask of the input conditions.
-    #         timestep ( `torch.LongTensor`):
-    #             Used to indicate denoising step.
-    #         attention_kwargs (`dict`, *optional*):
-    #             A kwargs dictionary that if specified is passed along to the `AttentionProcessor` as defined under
-    #             `self.processor` in
-    #             [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
-    #         return_dict (`bool`, *optional*, defaults to `True`):
-    #             Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
-    #             tuple.
-    #     Returns:
-    #         If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
-    #         `tuple` where the first element is the sample tensor.
-    #     """
-    #     if attention_kwargs is not None:
-    #         attention_kwargs = attention_kwargs.copy()
-    #         lora_scale = attention_kwargs.pop("scale", 1.0)
-    #     else:
-    #         lora_scale = 1.0
-
-    #     if USE_PEFT_BACKEND:
-    #         # weight the lora layers by setting `lora_scale` for each PEFT layer
-    #         scale_lora_layers(self, lora_scale)
-    #     else:
-    #         if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
-    #             logger.warning(
-    #                 "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
-    #             )
-
-    #     hidden_states = self.img_in(hidden_states)
-
-    #     timestep = timestep.to(hidden_states.dtype)
-    #     encoder_hidden_states = self.txt_norm(encoder_hidden_states)
-    #     encoder_hidden_states = self.txt_in(encoder_hidden_states)
-
-    #     if guidance is not None:
-    #         guidance = guidance.to(hidden_states.dtype) * 1000
-
-    #     temb = (
-    #         self.time_text_embed(timestep, hidden_states)
-    #         if guidance is None
-    #         else self.time_text_embed(timestep, guidance, hidden_states)
-    #     )
-
-    #     for index_block, block in enumerate(self.transformer_blocks):
-    #         if torch.is_grad_enabled() and self.gradient_checkpointing:
-    #             encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
-    #                 block,
-    #                 hidden_states,
-    #                 encoder_hidden_states,
-    #                 encoder_hidden_states_mask,
-    #                 temb,
-    #                 image_rotary_emb,
-    #             )
-
-    #         else:
-    #             encoder_hidden_states, hidden_states = block(
-    #                 hidden_states=hidden_states,
-    #                 encoder_hidden_states=encoder_hidden_states,
-    #                 encoder_hidden_states_mask=encoder_hidden_states_mask,
-    #                 temb=temb,
-    #                 image_rotary_emb=image_rotary_emb,
-    #                 joint_attention_kwargs=attention_kwargs,
-    #             )
-
-    #     # Use only the image part (hidden_states) from the dual-stream blocks
-    #     hidden_states = self.norm_out(hidden_states, temb)
-    #     output = self.proj_out(hidden_states)
-
-    #     if USE_PEFT_BACKEND:
-    #         # remove `lora_scale` from each PEFT layer
-    #         unscale_lora_layers(self, lora_scale)
-
-    #     if not return_dict:
-    #         return (output,)
-
-    #     return Transformer2DModelOutput(sample=output)
