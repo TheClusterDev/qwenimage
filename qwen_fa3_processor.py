@@ -71,6 +71,30 @@ class QwenDoubleStreamAttnProcessorFA3:
             # FA3 kernel path here does not consume arbitrary masks; fail fast to avoid silent correctness issues.
             raise NotImplementedError("attention_mask is not supported in this FA3 implementation.")
 
+                # ---- normalize rotary kwarg names & convert complex -> (cos, sin) real pair ----
+        # accept legacy/alias names
+        if image_rotary_emb is None:
+            image_rotary_emb = (
+                locals().get("image_rotary_emb", None)
+                or (locals().get("kwargs", {}) or {}).pop("image_rotary_embs", None)
+                or (locals().get("kwargs", {}) or {}).pop("rotary_emb", None)
+                or (locals().get("kwargs", {}) or {}).pop("image_rope", None)
+            )
+
+        def to_cossin(z):
+            # Accept complex [S,D], or already (cos,sin)
+            if isinstance(z, (tuple, list)) and len(z) == 2:
+                return z[0].contiguous(), z[1].contiguous()
+            if torch.is_complex(z):
+                return z.real.contiguous(), z.imag.contiguous()
+            raise ValueError("Unexpected rotary format; expected complex tensor or (cos, sin) pair.")
+
+        if image_rotary_emb is not None:
+            img_freqs, txt_freqs = image_rotary_emb
+            img_cos, img_sin = to_cossin(img_freqs)
+            txt_cos, txt_sin = to_cossin(txt_freqs)
+            image_rotary_emb = ((img_cos, img_sin), (txt_cos, txt_sin))
+            
         _ensure_fa3_available()
 
         B, S_img, _ = hidden_states.shape
@@ -108,13 +132,13 @@ class QwenDoubleStreamAttnProcessorFA3:
 
         # ---- RoPE (Qwen variant) ----
         if image_rotary_emb is not None:
-            img_freqs, txt_freqs = image_rotary_emb
-            # expects tensors shaped (B, S, H, D_h)
-            img_q = apply_rotary_emb_qwen(img_q, img_freqs, use_real=False)
-            img_k = apply_rotary_emb_qwen(img_k, img_freqs, use_real=False)
-            txt_q = apply_rotary_emb_qwen(txt_q, txt_freqs, use_real=False)
-            txt_k = apply_rotary_emb_qwen(txt_k, txt_freqs, use_real=False)
-
+            (img_cos, img_sin), (txt_cos, txt_sin) = image_rotary_emb
+            # real (cos,sin) path is stable on L40s
+            img_q = apply_rotary_emb_qwen(img_q, (img_cos, img_sin), use_real=True, use_real_unbind_dim=-1)
+            img_k = apply_rotary_emb_qwen(img_k, (img_cos, img_sin), use_real=True, use_real_unbind_dim=-1)
+            txt_q = apply_rotary_emb_qwen(txt_q, (txt_cos, txt_sin), use_real=True, use_real_unbind_dim=-1)
+            txt_k = apply_rotary_emb_qwen(txt_k, (txt_cos, txt_sin), use_real=True, use_real_unbind_dim=-1)
+            
         # ---- Joint attention over [text, image] along sequence axis ----
         # Shapes: (B, S_total, H, D_h)
         q = torch.cat([txt_q, img_q], dim=1)
