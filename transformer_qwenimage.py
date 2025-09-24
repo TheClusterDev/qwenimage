@@ -36,6 +36,23 @@ from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+# ---- RoPE helpers (real-valued, robust) ----
+def _rope_to_cos_sin(freqs):
+    # Accepts complex [S, D/2] or a (cos, sin) tuple; returns contiguous float32 (cos, sin)
+    if isinstance(freqs, (tuple, list)) and len(freqs) == 2:
+        cos, sin = freqs
+    elif torch.is_complex(freqs):
+        cos, sin = freqs.real, freqs.imag
+    else:
+        raise TypeError("image_rotary_emb must be complex RoPE or a (cos, sin) tuple")
+    return cos.contiguous().to(torch.float32), sin.contiguous().to(torch.float32)
+
+def _apply_rope_safe(x, cos_sin):
+    # Try standard pairing first; if layout differs (models vary), fall back.
+    try:
+        return apply_rotary_emb_qwen(x, cos_sin, use_real=True, use_real_unbind_dim=-1)
+    except Exception:
+        return apply_rotary_emb_qwen(x, cos_sin, use_real=True, use_real_unbind_dim=-2)
 
 def get_timestep_embedding(
     timesteps: torch.Tensor,
@@ -110,9 +127,8 @@ def apply_rotary_emb_qwen(
     """
     if use_real:
         cos, sin = freqs_cis  # [S, D]
-        cos = cos[None, None]
-        sin = sin[None, None]
-        cos, sin = cos.to(x.device), sin.to(x.device)
+        cos = cos[None, None].to(x.device, dtype=x.dtype)
+        sin = sin[None, None].to(x.device, dtype=x.dtype)
 
         if use_real_unbind_dim == -1:
             # Used for flux, cogvideox, hunyuan-dit
@@ -309,11 +325,21 @@ class QwenDoubleStreamAttnProcessor2_0:
 
         # Apply RoPE
         if image_rotary_emb is not None:
-            img_freqs, txt_freqs = image_rotary_emb
-            img_query = apply_rotary_emb_qwen(img_query, img_freqs, use_real=False)
-            img_key = apply_rotary_emb_qwen(img_key, img_freqs, use_real=False)
-            txt_query = apply_rotary_emb_qwen(txt_query, txt_freqs, use_real=False)
-            txt_key = apply_rotary_emb_qwen(txt_key, txt_freqs, use_real=False)
+            img_freqs, txt_freqs = image_rotary_emb  # can be complex or (cos, sin)
+        
+            img_cos_sin = _rope_to_cos_sin(img_freqs)
+            txt_cos_sin = _rope_to_cos_sin(txt_freqs)
+        
+            # ensure device/dtype match the target tensors
+            img_cos_sin = (img_cos_sin[0].to(img_query.device, dtype=img_query.dtype),
+                           img_cos_sin[1].to(img_query.device, dtype=img_query.dtype))
+            txt_cos_sin = (txt_cos_sin[0].to(txt_query.device, dtype=txt_query.dtype),
+                           txt_cos_sin[1].to(txt_query.device, dtype=txt_query.dtype))
+        
+            img_query = _apply_rope_safe(img_query, img_cos_sin)
+            img_key   = _apply_rope_safe(img_key,   img_cos_sin)
+            txt_query = _apply_rope_safe(txt_query, txt_cos_sin)
+            txt_key   = _apply_rope_safe(txt_key,   txt_cos_sin)
 
         # Concatenate for joint attention
         # Order: [text, image]
@@ -562,10 +588,7 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         for k, v in (("image_rotary_emb", image_rotary_emb), ("img_shapes", img_shapes), ("txt_seq_lens", txt_seq_lens)):
             if v is not None and k not in attention_kwargs:
                 attention_kwargs[k] = v
-        for k in ("image_rotary_embs", "rotary_emb", "image_rope", "img_ids", "controlnet_block_samples"):
-            if k in kwargs and k not in attention_kwargs:
-                attention_kwargs[k] = kwargs.pop(k)
-    
+       
         if USE_PEFT_BACKEND:
             scale_lora_layers(self, lora_scale)
         else:
