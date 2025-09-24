@@ -323,30 +323,24 @@ class QwenDoubleStreamAttnProcessor2_0:
         if attn.norm_added_k is not None:
             txt_key = attn.norm_added_k(txt_key)
 
-        # --- normalize rotary kwarg names and convert complex freqs to (cos, sin) for SM 8.x ---
-        rotary = image_rotary_emb
-        if rotary is None:
-            # accept legacy aliases
-            rotary = kwargs.pop("image_rotary_embs", None) or kwargs.pop("rotary_emb", None) or kwargs.pop("image_rope", None)
+        rotary = image_rotary_emb  # only this kw is supported here
 
         if rotary is not None:
             img_freqs, txt_freqs = rotary
 
-            # L40s (SM 8.9) can choke on complex inductor graphs. Convert complex -> (cos, sin) real pair.
+            # Convert complex RoPE -> (cos, sin) real pair (L40S dislikes complex in induction graphs)
             def to_cossin(z):
                 if torch.is_complex(z):
                     return (z.real.contiguous(), z.imag.contiguous())
-                # already (cos, sin)
                 if isinstance(z, (tuple, list)) and len(z) == 2:
-                    return (z[0], z[1])
-                raise ValueError("Unexpected rotary format")
+                    return (z[0].contiguous(), z[1].contiguous())
+                raise ValueError("Unexpected rotary format; expected complex or (cos, sin)")
 
             img_cos, img_sin = to_cossin(img_freqs)
             txt_cos, txt_sin = to_cossin(txt_freqs)
             image_rotary_emb = ((img_cos, img_sin), (txt_cos, txt_sin))
         else:
             image_rotary_emb = None
-        # -------------------------------------------------------------------
 
         # Apply RoPE
         if image_rotary_emb is not None:
@@ -600,9 +594,10 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
             attention_kwargs = {}
             lora_scale = 1.0
     
-        for k, v in (("image_rotary_emb", image_rotary_emb), ("img_shapes", img_shapes), ("txt_seq_lens", txt_seq_lens)):
+        # Do NOT stuff image_rotary_emb into attention_kwargs, we pass it explicitly.
+        for k, v in (("img_shapes", img_shapes), ("txt_seq_lens", txt_seq_lens)):
             if v is not None and k not in attention_kwargs:
-                attention_kwargs[k] = v
+                 attention_kwargs[k] = v
        
         if USE_PEFT_BACKEND:
             scale_lora_layers(self, lora_scale)
